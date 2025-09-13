@@ -1,0 +1,31 @@
+{
+  "name": "lady-byron/exact-search",
+  "type": "flarum-extension",
+  "description": "Force exact search for Meilisearch (companion to clarkwinkelmann/flarum-ext-scout).",
+  "license": "MIT",
+  "authors": [
+    { "name": "Lady Byron", "email": "admin@romanceof3.love" }
+  ],
+  "require": {
+    "flarum/core": "^1.6 || ^1.7 || ^1.8 || ^1.9",
+    "clarkwinkelmann/flarum-ext-scout": "^0.3"
+  },
+  "autoload": {
+    "psr-4": {
+      "LadyByron\\ExactSearch\\": "src/"
+    }
+  },
+  "extra": {
+    "flarum-extension": {
+      "title": "Exact Search (Meilisearch + Scout)",
+      "category": "search",
+      "icon": {
+        "name": "fas fa-bullseye",
+        "backgroundColor": "#2f855a",
+        "color": "#ffffff"
+      }
+    }
+  },
+  "minimum-stability": "stable",
+  "prefer-stable": true
+}
