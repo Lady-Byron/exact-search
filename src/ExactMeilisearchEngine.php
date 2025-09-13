@@ -2,188 +2,116 @@
 
 namespace LadyByron\ExactSearch;
 
-use Illuminate\Database\Eloquent\Collection;
-use Illuminate\Database\Eloquent\Model;
 use Laravel\Scout\Builder;
 use Laravel\Scout\Engines\Engine;
-use Meilisearch\Client;
+use Meilisearch\Client as Meili;
 
-/**
- * Standalone Meilisearch engine that does NOT depend on meilisearch-laravel-scout.
- * It talks to Meilisearch via meilisearch-php directly.
- * We only enforce strict search behaviour in search/paginate.
- */
 class ExactMeilisearchEngine extends Engine
 {
-    /** @var Client */
-    protected $meilisearch;
+    public function __construct(protected Meili $client) {}
 
-    public function __construct(Client $meilisearch)
+    /* === 强制精确匹配：把中文连续字符串自动加引号，并一律用 matchingStrategy=all === */
+    protected function tunedQuery(string $q = null): array
     {
-        $this->meilisearch = $meilisearch;
-    }
-
-    /* =========================
-       Indexing / Deleting data
-       ========================= */
-
-    public function update($models)
-    {
-        /** @var Collection|Model[] $models */
-        $models = $models instanceof Collection ? $models : Collection::make($models);
-        if ($models->isEmpty()) return;
-
-        $index = $models->first()->searchableAs();
-        $keyName = $models->first()->getScoutKeyName();
-
-        $documents = $models->map(function (Model $model) use ($keyName) {
-            $payload = array_filter($model->toSearchableArray(), static function ($v) {
-                return $v !== null;
-            });
-            // Ensure primary key exists
-            $payload[$keyName] = $model->getScoutKey();
-
-            return $payload;
-        })->values()->all();
-
-        $this->meilisearch->index($index)->addDocuments($documents, $keyName);
-    }
-
-    public function delete($models)
-    {
-        /** @var Collection|Model[] $models */
-        $models = $models instanceof Collection ? $models : Collection::make($models);
-        if ($models->isEmpty()) return;
-
-        $index = $models->first()->searchableAs();
-        $ids = $models->map->getScoutKey()->values()->all();
-
-        $this->meilisearch->index($index)->deleteDocuments($ids);
-    }
-
-    public function flush($model)
-    {
-        // Delete the entire index of the model
-        $this->meilisearch->index($model->searchableAs())->delete();
-    }
-
-    public function createIndex($name, array $options = [])
-    {
-        $opts = [];
-        if (isset($options['primaryKey'])) $opts['primaryKey'] = $options['primaryKey'];
-        $this->meilisearch->createIndex($name, $opts ?: null);
-    }
-
-    public function deleteIndex($name)
-    {
-        $this->meilisearch->index($name)->delete();
-    }
-
-    /* =========================
-       Searching (our special sauce)
-       ========================= */
-
-    protected function strictOptions(array $options = []): array
-    {
-        // Require all tokens to match
-        $options['matchingStrategy'] = 'all';
-        return $options;
-    }
-
-    protected function normalizeQuery(string $q): string
-    {
-        $q = trim($q);
-        if ($q === '') return $q;
-
-        // If already a phrase or contains whitespace, don't touch.
-        if ((substr($q, 0, 1) === '"' && substr($q, -1) === '"') || preg_match('/\s/u', $q)) {
-            return $q;
+        if ($q === null || $q === '') {
+            return [null, []];
         }
 
-        // Pure CJK (>=2 Han chars) => phrase search
-        if (preg_match('/^[\x{4E00}-\x{9FFF}]{2,}$/u', $q)) {
-            return '"' . $q . '"';
+        $query = $q;
+
+        // 纯中文且没有空白：自动加一对引号，形成短语查询
+        if (!str_contains($query, '"')
+            && preg_match('/^\p{Han}+$/u', $query)     // 全是 CJK
+        ) {
+            $query = "\"{$query}\"";
         }
 
-        return $q;
+        // 统一把策略改成 'all'
+        $options = ['matchingStrategy' => 'all'];
+
+        return [$query, $options];
     }
 
+    /* --- Scout 必需：search / paginate --- */
     public function search(Builder $builder)
     {
-        $index = $builder->index ?? $builder->model->searchableAs();
-        $query = $this->normalizeQuery($builder->query);
-        $options = $this->strictOptions($builder->options);
+        [$q, $opts] = $this->tunedQuery((string) $builder->query);
 
-        // Where filters from Builder (if any) -> turn into Meili filter syntax if simple equals
-        if (!empty($builder->wheres)) {
-            // Extremely simple equality-only support
-            $filters = [];
-            foreach ($builder->wheres as $field => $value) {
-                if (is_scalar($value)) {
-                    $filters[] = $field . ' = "' . addcslashes((string)$value, '"') . '"';
-                }
-            }
-            if ($filters) $options['filter'] = implode(' AND ', $filters);
-        }
+        $index = $this->client->index($builder->index ?? $builder->model->searchableAs());
 
-        return $this->meilisearch->index($index)->search($query, $options);
+        // 合并调用方 options（若有）：
+        $options = array_merge($builder->options ?? [], $opts);
+
+        return $index->search($q, $options)->toArray();
     }
 
     public function paginate(Builder $builder, $perPage, $page)
     {
-        $index = $builder->index ?? $builder->model->searchableAs();
-        $query = $this->normalizeQuery($builder->query);
-        $options = $this->strictOptions($builder->options);
-        $options['limit']  = (int) $perPage;
-        $options['offset'] = max(0, ((int)$page - 1) * (int)$perPage);
+        [$q, $opts] = $this->tunedQuery((string) $builder->query);
 
-        if (!empty($builder->wheres)) {
-            $filters = [];
-            foreach ($builder->wheres as $field => $value) {
-                if (is_scalar($value)) {
-                    $filters[] = $field . ' = "' . addcslashes((string)$value, '"') . '"';
-                }
-            }
-            if ($filters) $options['filter'] = implode(' AND ', $filters);
-        }
+        $index = $this->client->index($builder->index ?? $builder->model->searchableAs());
 
-        return $this->meilisearch->index($index)->search($query, $options);
+        $options = array_merge($builder->options ?? [], $opts, [
+            'limit'  => (int) $perPage,
+            'offset' => (int) (($page - 1) * $perPage),
+        ]);
+
+        return $index->search($q, $options)->toArray();
     }
 
+    /* --- Scout 必需：把结果转回模型 / ID / 总数 --- */
     public function mapIds($results)
     {
         $hits = $results['hits'] ?? [];
-        if (!$hits) return collect();
-
-        // Try common keys (id/primary key)
-        $first = $hits[0] ?? [];
-        $key = array_key_exists('id', $first) ? 'id' : (array_key_exists('objectID', $first) ? 'objectID' : null);
-        if (!$key) return collect();
-
-        return collect($hits)->pluck($key)->values();
+        return collect($hits)->pluck('id');
     }
 
     public function map(Builder $builder, $results, $model)
     {
-        $hits = $results['hits'] ?? [];
-        if (!$hits) return $model->newCollection();
-
         $ids = $this->mapIds($results)->all();
-        if (!$ids) return $model->newCollection();
+        if (empty($ids)) {
+            return $model->newCollection();
+        }
 
-        // Let Scout fetch models (respects custom scopes)
-        $models = $model->getScoutModelsByIds($builder, $ids);
-
-        // Keep the Meili order
-        $models = $models->sortBy(function ($m) use ($ids) {
-            return array_search($m->getScoutKey(), $ids, true);
-        })->values();
-
-        return $models;
+        $keyName = $model->getKeyName();
+        // 保持命中顺序
+        $models = $model->whereIn($keyName, $ids)->get()->keyBy($keyName);
+        return collect($ids)->map(fn ($id) => $models[$id] ?? null)->filter();
     }
 
     public function getTotalCount($results)
     {
-        return $results['estimatedTotalHits'] ?? $results['nbHits'] ?? 0;
+        return (int) ($results['estimatedTotalHits'] ?? $results['nbHits'] ?? 0);
+    }
+
+    /* --- 你的 Scout 版本要求的额外抽象方法 --- */
+    public function lazyMap(Builder $builder, $results, $model)
+    {
+        // 安全起见，直接复用 map 的行为
+        return $this->map($builder, $results, $model);
+    }
+
+    /* --- 索引同步相关：最小实现即可 --- */
+    public function update($models)
+    {
+        $index = $this->client->index($models->first()->searchableAs());
+        $payload = $models->map->toSearchableArray()->values()->all();
+        if (! empty($payload)) {
+            $index->addDocuments($payload, $models->first()->getKeyName());
+        }
+    }
+
+    public function delete($models)
+    {
+        $index = $this->client->index($models->first()->searchableAs());
+        $ids   = $models->pluck($models->first()->getKeyName())->values()->all();
+        if (! empty($ids)) {
+            $index->deleteDocuments($ids);
+        }
+    }
+
+    public function flush($model)
+    {
+        $this->client->index($model->searchableAs())->deleteAllDocuments();
     }
 }
