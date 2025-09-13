@@ -11,24 +11,29 @@ class ExactScoutServiceProvider extends AbstractServiceProvider
 {
     public function boot(EngineManager $engines)
     {
-        // 覆盖同名驱动，不用你在后台切换 driver
+        // 没装 meilisearch-php 时直接跳过，避免后台 500
+        if (!class_exists(Client::class)) {
+            return;
+        }
+
+        // 覆盖同名 'meilisearch' 驱动（无需在后台切换驱动选择）
         $engines->extend('meilisearch', function ($app) {
-            // 1) 环境变量（推荐在 docker-compose 给 PHP 容器注入）
+            // 1) 环境变量（推荐用 docker-compose 注入到 PHP 容器）
             $host = getenv('SCOUT_MEILISEARCH_HOST') ?: getenv('MEILISEARCH_HOST') ?: null;
             $key  = getenv('SCOUT_MEILISEARCH_KEY')  ?: getenv('MEILISEARCH_KEY')  ?: null;
 
-            // 2) Scout 扩展的后台设置（若存在）
+            // 2) Scout 扩展后台设置（若存在）
             if (!$host && interface_exists(SettingsRepositoryInterface::class)) {
                 /** @var SettingsRepositoryInterface $settings */
                 $settings = $app->make(SettingsRepositoryInterface::class);
                 $host = $settings->get('clarkwinkelmann-scout.meilisearchHost')
                     ?: $settings->get('clarkwinkelmann-scout.meilisearchUrl')
                     ?: $host;
-                $key  = $key ?: $settings->get('clarkwinkelmann-scout.meilisearchKey');
+                $key = $key ?: $settings->get('clarkwinkelmann-scout.meilisearchKey');
             }
 
-            // 3) Laravel 配置（若项目里有）
-            if (!$host && $app->bound('config')) {
+            // 3) Laravel 配置（若存在）
+            if (!$host && isset($app['config'])) {
                 $cfg  = $app['config'];
                 $host = $cfg->get('scout.meilisearch.host', $host);
                 $key  = $cfg->get('scout.meilisearch.key',  $key);
@@ -41,3 +46,4 @@ class ExactScoutServiceProvider extends AbstractServiceProvider
         });
     }
 }
+
