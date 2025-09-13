@@ -3,10 +3,10 @@
 namespace LadyByron\ExactSearch;
 
 use Laravel\Scout\Builder;
-use Laravel\Scout\Engines\MeilisearchEngine;
 use Meilisearch\Client;
+use Meilisearch\Scout\Engines\MeilisearchEngine as BaseMeilisearchEngine;
 
-class ExactMeilisearchEngine extends MeilisearchEngine
+class ExactMeilisearchEngine extends BaseMeilisearchEngine
 {
     public function __construct(Client $meilisearch)
     {
@@ -15,6 +15,7 @@ class ExactMeilisearchEngine extends MeilisearchEngine
 
     protected function strict(array $options): array
     {
+        // 所有分词必须命中
         $options['matchingStrategy'] = 'all';
         return $options;
     }
@@ -24,11 +25,15 @@ class ExactMeilisearchEngine extends MeilisearchEngine
         $q = trim($q);
         if ($q === '') return $q;
 
-        // 已经是短语或含空白的不改
-        if ((substr($q,0,1)==='"' && substr($q,-1)==='"') || preg_match('/\s/u',$q)) return $q;
+        // 已加引号或包含空白的不改
+        if ((substr($q, 0, 1) === '"' && substr($q, -1) === '"') || preg_match('/\s/u', $q)) {
+            return $q;
+        }
 
-        // 纯中文（2+汉字）→ 短语
-        if (preg_match('/^[\x{4E00}-\x{9FFF}]{2,}$/u', $q)) return '"'.$q.'"';
+        // 纯中文（2+汉字）自动变短语查询
+        if (preg_match('/^[\x{4E00}-\x{9FFF}]{2,}$/u', $q)) {
+            return '"' . $q . '"';
+        }
 
         return $q;
     }
