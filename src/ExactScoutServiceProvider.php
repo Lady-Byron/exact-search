@@ -3,21 +3,41 @@
 namespace LadyByron\ExactSearch;
 
 use Flarum\Foundation\AbstractServiceProvider;
+use Flarum\Settings\SettingsRepositoryInterface;
 use Laravel\Scout\EngineManager;
-use Meilisearch\Client as MeiliClient;
+use Meilisearch\Client;
 
 class ExactScoutServiceProvider extends AbstractServiceProvider
 {
     public function boot(EngineManager $engines)
     {
-        // 用同名覆盖 'meilisearch' 驱动，避免要求在后台改“驱动”下拉框
+        // 覆盖同名驱动，不用你在后台切换 driver
         $engines->extend('meilisearch', function ($app) {
-            // 直接用 meilisearch-php 客户端，避免依赖某个“具体 Engine 类”
-            $host = $app->make('config')->get('scout.meilisearch.host');
-            $key  = $app->make('config')->get('scout.meilisearch.key');
+            // 1) 环境变量（推荐在 docker-compose 给 PHP 容器注入）
+            $host = getenv('SCOUT_MEILISEARCH_HOST') ?: getenv('MEILISEARCH_HOST') ?: null;
+            $key  = getenv('SCOUT_MEILISEARCH_KEY')  ?: getenv('MEILISEARCH_KEY')  ?: null;
 
-            $client = new MeiliClient($host, $key);
-            return new ExactMeilisearchEngine($client);
+            // 2) Scout 扩展的后台设置（若存在）
+            if (!$host && interface_exists(SettingsRepositoryInterface::class)) {
+                /** @var SettingsRepositoryInterface $settings */
+                $settings = $app->make(SettingsRepositoryInterface::class);
+                $host = $settings->get('clarkwinkelmann-scout.meilisearchHost')
+                    ?: $settings->get('clarkwinkelmann-scout.meilisearchUrl')
+                    ?: $host;
+                $key  = $key ?: $settings->get('clarkwinkelmann-scout.meilisearchKey');
+            }
+
+            // 3) Laravel 配置（若项目里有）
+            if (!$host && $app->bound('config')) {
+                $cfg  = $app['config'];
+                $host = $cfg->get('scout.meilisearch.host', $host);
+                $key  = $cfg->get('scout.meilisearch.key',  $key);
+            }
+
+            // 4) 兜底：容器内网直连
+            $host = $host ?: 'http://meilisearch:7700';
+
+            return new ExactMeilisearchEngine(new Client($host, $key ?: null));
         });
     }
 }
