@@ -10,10 +10,10 @@ use Laravel\Scout\Engines\Engine;
 use Meilisearch\Client;
 
 /**
- * Standalone Meilisearch engine (no dependency on a concrete Meili-Scout adapter).
- * Forces strict matching in search/paginate:
+ * 独立的 Meilisearch 引擎（不依赖具体适配包）。
+ * 强制精确匹配：
  *   - matchingStrategy = 'all'
- *   - pure CJK query (no whitespace) => phrase (wrap with quotes)
+ *   - 纯中文且无空白 -> 自动包成 "短语"（相邻同序匹配）
  */
 class ExactMeilisearchEngine extends Engine
 {
@@ -25,9 +25,7 @@ class ExactMeilisearchEngine extends Engine
         $this->meilisearch = $meilisearch;
     }
 
-    /* =========================
-       Indexing / Deleting data
-       ========================= */
+    /* ========== 索引同步 ========== */
 
     public function update($models)
     {
@@ -42,7 +40,7 @@ class ExactMeilisearchEngine extends Engine
             $payload = array_filter($model->toSearchableArray(), static function ($v) {
                 return $v !== null;
             });
-            // ensure primary key is present
+            // 确保主键存在
             $payload[$keyName] = $model->getScoutKey();
             return $payload;
         })->values()->all();
@@ -64,7 +62,7 @@ class ExactMeilisearchEngine extends Engine
 
     public function flush($model)
     {
-        // Remove all documents, keep index
+        // 清空所有文档，保留索引
         $this->meilisearch->index($model->searchableAs())->deleteAllDocuments();
     }
 
@@ -77,7 +75,7 @@ class ExactMeilisearchEngine extends Engine
         try {
             $this->meilisearch->createIndex($name, $opts ?: null);
         } catch (\Throwable $e) {
-            // ignore "index already exists"
+            // 忽略“已存在”
         }
     }
 
@@ -86,17 +84,15 @@ class ExactMeilisearchEngine extends Engine
         try {
             $this->meilisearch->index($name)->delete();
         } catch (\Throwable $e) {
-            // ignore "index not found"
+            // 忽略“不存在”
         }
     }
 
-    /* =========================
-       Searching (our special sauce)
-       ========================= */
+    /* ========== 搜索（关键逻辑） ========== */
 
     protected function strictOptions(array $options = []): array
     {
-        // require all tokens to match
+        // 所有分词必须命中
         $options['matchingStrategy'] = 'all';
         return $options;
     }
@@ -106,17 +102,35 @@ class ExactMeilisearchEngine extends Engine
         $q = trim($q);
         if ($q === '') return $q;
 
-        // already a phrase or contains whitespace? don't touch
+        // 已是短语或含空白 -> 不改
         if ((substr($q, 0, 1) === '"' && substr($q, -1) === '"') || preg_match('/\s/u', $q)) {
             return $q;
         }
 
-        // pure CJK (>= 2 Han chars) => phrase search
+        // 纯中文（>=2 汉字）-> 转为短语
         if (preg_match('/^[\x{4E00}-\x{9FFF}]{2,}$/u', $q)) {
             return '"' . $q . '"';
         }
 
         return $q;
+    }
+
+    private function resultToArray($res): array
+    {
+        if (is_array($res)) return $res;
+
+        if (is_object($res)) {
+            // meilisearch-php v1.5+ 的 SearchResult
+            if (method_exists($res, 'toArray')) return $res->toArray();
+            if (method_exists($res, 'getRaw'))  return $res->getRaw();
+
+            $hits = method_exists($res, 'getHits') ? $res->getHits() : [];
+            $est  = method_exists($res, 'getEstimatedTotalHits') ? $res->getEstimatedTotalHits() : null;
+            $tot  = method_exists($res, 'getTotalHits') ? $res->getTotalHits() : null;
+            return ['hits' => $hits, 'estimatedTotalHits' => $est, 'totalHits' => $tot];
+        }
+
+        return [];
     }
 
     public function search(Builder $builder)
@@ -125,18 +139,19 @@ class ExactMeilisearchEngine extends Engine
         $query   = $this->normalizeQuery((string) $builder->query);
         $options = $this->strictOptions($builder->options ?? []);
 
-        // simple equality wheres -> Meili filter
+        // 简单等值 where -> Meili filter
         if (!empty($builder->wheres)) {
             $filters = [];
             foreach ($builder->wheres as $field => $value) {
                 if (is_scalar($value)) {
-                    $filters[] = $field . ' = "' . addcslashes((string)$value, '"') . '"';
+                    $filters[] = $field . ' = "' . addcslashes((string) $value, '"') . '"';
                 }
             }
             if ($filters) $options['filter'] = implode(' AND ', $filters);
         }
 
-        return $this->meilisearch->index($index)->search($query, $options);
+        $res = $this->meilisearch->index($index)->search($query, $options);
+        return $this->resultToArray($res);
     }
 
     public function paginate(Builder $builder, $perPage, $page)
@@ -145,30 +160,34 @@ class ExactMeilisearchEngine extends Engine
         $query   = $this->normalizeQuery((string) $builder->query);
         $options = $this->strictOptions($builder->options ?? []);
         $options['limit']  = (int) $perPage;
-        $options['offset'] = max(0, ((int)$page - 1) * (int)$perPage);
+        $options['offset'] = max(0, ((int) $page - 1) * (int) $perPage);
 
         if (!empty($builder->wheres)) {
             $filters = [];
             foreach ($builder->wheres as $field => $value) {
                 if (is_scalar($value)) {
-                    $filters[] = $field . ' = "' . addcslashes((string)$value, '"') . '"';
+                    $filters[] = $field . ' = "' . addcslashes((string) $value, '"') . '"';
                 }
             }
             if ($filters) $options['filter'] = implode(' AND ', $filters);
         }
 
-        return $this->meilisearch->index($index)->search($query, $options);
+        $res = $this->meilisearch->index($index)->search($query, $options);
+        return $this->resultToArray($res);
     }
+
+    /* ========== 结果映射 ========== */
 
     public function mapIds($results)
     {
-        $hits = $results['hits'] ?? [];
+        $arr  = $this->resultToArray($results);
+        $hits = $arr['hits'] ?? [];
         if (!$hits) return collect();
 
         $first = $hits[0] ?? [];
         $key   = array_key_exists('id', $first)
-               ? 'id'
-               : (array_key_exists('objectID', $first) ? 'objectID' : null);
+            ? 'id'
+            : (array_key_exists('objectID', $first) ? 'objectID' : null);
 
         if (!$key) return collect();
 
@@ -177,25 +196,27 @@ class ExactMeilisearchEngine extends Engine
 
     public function map(Builder $builder, $results, $model)
     {
-        $hits = $results['hits'] ?? [];
+        $arr  = $this->resultToArray($results);
+        $hits = $arr['hits'] ?? [];
         if (!$hits) return $model->newCollection();
 
-        $ids = $this->mapIds($results)->all();
+        $ids = $this->mapIds($arr)->all();
         if (!$ids) return $model->newCollection();
 
-        // Let Scout fetch models (respects scopes)
+        // 让 Scout 依自身逻辑取模型（保留作用域）
         $models = $model->getScoutModelsByIds($builder, $ids)->keyBy(function ($m) {
             return $m->getScoutKey();
         });
 
-        // Keep Meili order
+        // 保持 Meili 返回顺序
         return collect($ids)->map(function ($id) use ($models) {
             return $models->get($id);
         })->filter()->values();
     }
 
-    public function lazyMap(Builder $builder, $results, $model): LazyCollection
+    public function lazyMap(Builder $builder, $results, $model)
     {
+        // 兼容新版 Scout：以 LazyCollection 形式返回
         return LazyCollection::make(function () use ($builder, $results, $model) {
             foreach ($this->map($builder, $results, $model) as $item) {
                 yield $item;
@@ -205,7 +226,8 @@ class ExactMeilisearchEngine extends Engine
 
     public function getTotalCount($results)
     {
-        return (int) ($results['estimatedTotalHits'] ?? $results['nbHits'] ?? 0);
+        $arr = $this->resultToArray($results);
+        return (int) ($arr['totalHits'] ?? $arr['estimatedTotalHits'] ?? $arr['nbHits'] ?? 0);
     }
 }
 
