@@ -35,8 +35,7 @@ class ApplyTitleFirstOnRelevance
 
     /**
      * 兜底阶段：控制器序列化前对数据进行稳定重排（保证 100% 生效）
-     * 签名为 ApiController::prepareDataForSerialization 的回调：
-     * function ($controller, array|Collection|Paginator &$data, ServerRequestInterface $request, Document $document)
+     * 签名为 ApiController::prepareDataForSerialization 的回调（按引用接收 $data）
      */
     public function __invoke($controller, &$data, ServerRequestInterface $request, $document): void
     {
@@ -62,8 +61,7 @@ class ApplyTitleFirstOnRelevance
             $data = $this->reorderCollection($data, $positions);
             return;
         }
-
-        // 若是数组/其它类型，保持安全不处理
+        // 其它类型不处理
     }
 
     /**
@@ -81,22 +79,26 @@ class ApplyTitleFirstOnRelevance
     }
 
     /**
-     * 生成“标题优先，其次正文”的 ID 顺序与位置表
+     * —— 核心改进点 ——
+     * 生成“标题优先，其次正文”的 ID 顺序与位置表。
+     * 为了避免极少数“标题含有关键词却被排到末端”的情况，
+     * 这里在原有的 Meili 命中基础上，增加一次 **数据库标题 LIKE** 的补充，
+     * 把所有“title LIKE %q%”的讨论优先合并到前面，保证真正的“标题命中”都靠前。
      */
     private function buildOrder(string $q): array
     {
-        // 1) 标题命中
-        $titleIds = ScoutStatic::makeBuilder(Discussion::class, $q)->keys()->all();
-        $titleIds = array_values(array_unique(array_map('intval', $titleIds)));
+        // A) 先取“标题命中（Meili 视角）”
+        $titleIdsMeili = array_values(array_unique(array_map('intval',
+            ScoutStatic::makeBuilder(Discussion::class, $q)->keys()->all()
+        )));
 
-        // 2) 正文命中 -> discussion_id
+        // B) 再取“正文命中 -> discussion_id”
         $postIds = ScoutStatic::makeBuilder(Post::class, $q)->keys()->all();
         $bodyDiscussionIds = [];
         if ($postIds) {
             $map = Post::query()
                 ->whereIn('id', array_map('intval', $postIds))
-                ->pluck('discussion_id', 'id'); // key: post_id, value: discussion_id
-
+                ->pluck('discussion_id', 'id'); // key: post_id
             foreach ($postIds as $pid) {
                 $pid = (int) $pid;
                 if (isset($map[$pid])) {
@@ -106,19 +108,18 @@ class ApplyTitleFirstOnRelevance
             $bodyDiscussionIds = array_values(array_unique($bodyDiscussionIds));
         }
 
-        if (!$titleIds && !$bodyDiscussionIds) {
+        // C) 关键补充：用 DB 直接匹配 title LIKE "%phrase%"
+        // 仅在“单段词（不含空白）且长度 2~32”时启用，避免对英文长查询过度扫表
+        $titleIdsDb = $this->titleContainsIds($q);
+
+        // D) 合并顺序：标题(明确 LIKE 命中) → 标题(引擎命中) → 正文(引擎命中)
+        $ordered = $this->mergeIdsStable([$titleIdsDb, $titleIdsMeili, $bodyDiscussionIds]);
+
+        if (!$ordered) {
             return [[], []];
         }
 
-        // 标题优先 + 合并正文命中
-        $ordered = $titleIds;
-        foreach ($bodyDiscussionIds as $did) {
-            if (!in_array($did, $ordered, true)) {
-                $ordered[] = $did;
-            }
-        }
-
-        // 限制长度，避免巨大的 FIELD 列表
+        // 控制长度，避免 FIELD 列表过大
         $ordered   = array_slice($ordered, 0, 1000);
         $positions = array_flip($ordered);
 
@@ -149,6 +150,68 @@ class ApplyTitleFirstOnRelevance
     }
 
     /**
+     * 取出“明显的标题短语”并用 LIKE 匹配 title，返回命中 discussion id（最多 500）
+     * 只在单段（不含空白）且长度 2~32 时启用，适配中文“连续词”场景（如“曹刘”）
+     */
+    private function titleContainsIds(string $rawQ): array
+    {
+        $phrase = $this->extractTitlePhraseCandidate($rawQ);
+        if ($phrase === '') return [];
+
+        $model = new Discussion();
+        $table = $model->getTable();
+        $conn  = $model->getConnection();
+
+        // 转义 LIKE 特殊字符
+        $like = '%' . strtr($phrase, ['\\' => '\\\\', '%' => '\%', '_' => '\_']) . '%';
+
+        // 使用 ESCAPE '\\'，兼容 MySQL/MariaDB，限制最多 500 条
+        $ids = $conn->table($table)
+            ->whereRaw("{$table}.title LIKE ? ESCAPE '\\\\'", [$like])
+            ->limit(500)
+            ->pluck('id')
+            ->all();
+
+        return array_values(array_unique(array_map('intval', $ids)));
+    }
+
+    /**
+     * 从原查询中提取“适合用来匹配标题的短语”
+     * - 去掉首尾引号
+     * - 含空白则放弃（避免英文长句扫表）
+     * - 长度限制 2~32
+     */
+    private function extractTitlePhraseCandidate(string $q): string
+    {
+        $q = trim($q);
+        if ($q === '') return '';
+
+        $first = substr($q, 0, 1);
+        $last  = substr($q, -1);
+        if (($first === '"' && $last === '"') || ($first === "'" && $last === "'")) {
+            $q = substr($q, 1, -1);
+            $q = trim($q);
+        }
+
+        // 含空白则放弃（避免过宽）
+        if (preg_match('/\s/u', $q)) {
+            return '';
+        }
+
+        // 长度 2~32
+        if (function_exists('mb_strlen')) {
+            $len = mb_strlen($q, 'UTF-8');
+        } else {
+            $len = strlen($q);
+        }
+        if ($len < 2 || $len > 32) {
+            return '';
+        }
+
+        return $q;
+    }
+
+    /**
      * 内存稳定重排（保持未命中项原相对顺序）
      */
     private function reorderCollection(Collection $c, array $positions): Collection
@@ -166,5 +229,24 @@ class ApplyTitleFirstOnRelevance
                 return $pa === $pb ? ($origIndex[$ida] <=> $origIndex[$idb]) : ($pa <=> $pb);
             })
             ->values();
+    }
+
+    /**
+     * 把若干 ID 列表按先后优先级合并为不重复的有序列表（稳定）
+     */
+    private function mergeIdsStable(array $lists): array
+    {
+        $seen = [];
+        $out  = [];
+        foreach ($lists as $list) {
+            foreach ($list as $id) {
+                $id = (int) $id;
+                if (!isset($seen[$id])) {
+                    $seen[$id] = true;
+                    $out[] = $id;
+                }
+            }
+        }
+        return $out;
     }
 }
