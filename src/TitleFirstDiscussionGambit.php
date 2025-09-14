@@ -19,11 +19,11 @@ class TitleFirstDiscussionGambit implements GambitInterface
             return;
         }
 
-        // 1) 取标题命中讨论ID（优先级高）
+        // 1) 标题命中讨论ID
         $titleIds = ScoutStatic::makeBuilder(Discussion::class, $q)->keys()->all();
         $titleIds = array_values(array_unique(array_map('intval', $titleIds)));
 
-        // 2) 取帖子命中ID，映射为讨论ID（优先级低）
+        // 2) 正文命中 -> 映射为讨论ID
         $postIds = ScoutStatic::makeBuilder(Post::class, $q)->keys()->all();
         $postDiscussionIds = [];
         if ($postIds) {
@@ -34,48 +34,32 @@ class TitleFirstDiscussionGambit implements GambitInterface
         }
         $postDiscussionIds = array_values(array_unique(array_map('intval', $postDiscussionIds)));
 
-        // 3) 搜索结果 = 两组并集（保证正文命中也能出现）
+        // 3) 并集（确保正文命中也能出现）
         $allIds = array_values(array_unique(array_merge($titleIds, $postDiscussionIds)));
 
-        // 若空，直接返回空结果
         if (!$allIds) {
             $search->getQuery()->whereRaw('0=1');
             return;
         }
 
-        // 4) 仅做“标题优先的分组排序”，其余排序交给核心/插件
+        // 4) 仅限定命中集合；不添加任何排序（把“标题优先”交给后面的 Listener 在 relevance 时加入）
         $builder = $search->getQuery();
 
         if ($builder instanceof EloquentBuilder) {
             $model  = $builder->getModel();
             $conn   = $model->getConnection();
-            $prefix = $conn->getTablePrefix();          // 例如 flarum_
-            $table  = $model->getTable();               // 可能已带前缀
-            $pk     = $model->getKeyName();             // id
+            $prefix = $conn->getTablePrefix();
+            $table  = $model->getTable();
+            $pk     = $model->getKeyName();
 
-            // WHERE 用“去前缀”的表名，交给语法器自动加一次前缀
+            // WHERE 用“去前缀”的表名，交给语法器自动再加一次前缀
             $tableNoPrefix = $table;
             if ($prefix && strpos($tableNoPrefix, $prefix) === 0) {
                 $tableNoPrefix = substr($tableNoPrefix, strlen($prefix));
             }
             $qualifiedForWhere = $tableNoPrefix . '.' . $pk;
 
-            // ORDER BY RAW 用“已带前缀”的表名（raw 不会再自动加前缀）
-            $prefixedTable = $table;
-            if ($prefix && strpos($prefixedTable, $prefix) !== 0) {
-                $prefixedTable = $prefix . $prefixedTable;
-            }
-            $qualifiedForOrder = $prefixedTable . '.' . $pk;
-
-            // 先限定搜索集合
             $builder->whereIn($qualifiedForWhere, $allIds);
-
-            // 仅当存在标题命中时才增加“标题优先”的分组排序
-            if ($titleIds) {
-                $placeholders = implode(',', array_fill(0, count($titleIds), '?'));
-                // 0 在前（标题命中），1 在后（仅正文命中）
-                $builder->orderByRaw("CASE WHEN $qualifiedForOrder IN ($placeholders) THEN 0 ELSE 1 END", $titleIds);
-            }
 
         } elseif ($builder instanceof QueryBuilder) {
             $conn   = $builder->getConnection();
@@ -89,21 +73,10 @@ class TitleFirstDiscussionGambit implements GambitInterface
             }
             $qualifiedForWhere = $fromNoPrefix . '.' . $pk;
 
-            $prefixedFrom = $from;
-            if ($prefix && strpos($prefixedFrom, $prefix) !== 0) {
-                $prefixedFrom = $prefix . $prefixedFrom;
-            }
-            $qualifiedForOrder = $prefixedFrom . '.' . $pk;
-
             $builder->whereIn($qualifiedForWhere, $allIds);
 
-            if ($titleIds) {
-                $placeholders = implode(',', array_fill(0, count($titleIds), '?'));
-                $builder->orderByRaw("CASE WHEN $qualifiedForOrder IN ($placeholders) THEN 0 ELSE 1 END", $titleIds);
-            }
-
         } else {
-            // 兜底：尽量不破坏排序，只限定集合
+            // 兜底：尽量不破坏查询，仅限定集合
             $model  = new Discussion();
             $conn   = $model->getConnection();
             $prefix = $conn->getTablePrefix();
@@ -114,14 +87,12 @@ class TitleFirstDiscussionGambit implements GambitInterface
             if ($prefix && strpos($tableNoPrefix, $prefix) === 0) {
                 $tableNoPrefix = substr($tableNoPrefix, strlen($prefix));
             }
-            $qualifiedForWhere = $tableNoPrefix . '.' . $pk;
 
             try {
-                $search->getQuery()->whereIn($qualifiedForWhere, $allIds);
+                $search->getQuery()->whereIn($tableNoPrefix . '.' . $pk, $allIds);
             } catch (\Throwable $e) {
                 $search->getQuery()->whereIn($pk, $allIds);
             }
-            // 不加任何 orderByRaw，交给后续排序器处理
         }
     }
 }
