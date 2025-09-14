@@ -51,33 +51,39 @@ class TitleFirstDiscussionGambit implements GambitInterface
         $builder = $search->getQuery(); // 可能是 Eloquent\Builder 或 Query\Builder
 
         if ($builder instanceof EloquentBuilder) {
-            $table = $builder->getModel()->getTable();   // 如 flarum_discussions
-            $pk    = $builder->getModel()->getKeyName(); // 一般是 id
-            $qualifiedPk = $table . '.' . $pk;
+            $model  = $builder->getModel();
+            $table  = $model->getTable();                                // e.g. discussions（未带前缀）
+            $prefix = $model->getConnection()->getTablePrefix();         // e.g. flarum_
+            $pk     = $model->getKeyName();                              // e.g. id
+            $from   = ($prefix ?: '') . $table;                          // e.g. flarum_discussions
+            $qualifiedPk = $from . '.' . $pk;                            // e.g. flarum_discussions.id
 
             $builder->whereIn($qualifiedPk, $order);
-
             $placeholders = implode(',', array_fill(0, count($order), '?'));
             $builder->orderByRaw("FIELD($qualifiedPk, $placeholders)", $order);
 
         } elseif ($builder instanceof QueryBuilder) {
-            // 已是底层查询构建器：直接使用
-            $table = $builder->from ?: (new Discussion())->getTable();
-            $pk    = (new Discussion())->getKeyName();
-            $qualifiedPk = $table . '.' . $pk;
+            // Query\Builder 通常 from 已含前缀；若未含则补齐
+            $from   = $builder->from ?: (new Discussion())->getTable();  // 可能是 flarum_discussions 或 discussions
+            $prefix = $builder->getConnection()->getTablePrefix();       // e.g. flarum_
+            if ($prefix && strpos($from, $prefix) !== 0) {
+                $from = $prefix . $from;
+            }
+            $pk     = (new Discussion())->getKeyName();                  // e.g. id
+            $qualifiedPk = $from . '.' . $pk;
 
             $builder->whereIn($qualifiedPk, $order);
-
             $placeholders = implode(',', array_fill(0, count($order), '?'));
             $builder->orderByRaw("FIELD($qualifiedPk, $placeholders)", $order);
 
         } else {
-            // 极端情况：无法识别类型，至少加一个 whereIn 兜底（不排序）
-            $table = (new Discussion())->getTable();
-            $pk    = (new Discussion())->getKeyName();
-            $qualifiedPk = $table . '.' . $pk;
+            // 极端兜底：限制集合，不排序
+            $model  = new Discussion();
+            $table  = $model->getTable();
+            $prefix = $model->getConnection()->getTablePrefix();
+            $pk     = $model->getKeyName();
+            $qualifiedPk = ($prefix ?: '') . $table . '.' . $pk;
 
-            // 尝试以最通用方式限制集合
             try {
                 $search->getQuery()->whereIn($qualifiedPk, $order);
             } catch (\Throwable $e) {
@@ -86,4 +92,3 @@ class TitleFirstDiscussionGambit implements GambitInterface
         }
     }
 }
-
