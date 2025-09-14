@@ -52,11 +52,17 @@ class TitleFirstDiscussionGambit implements GambitInterface
 
         if ($builder instanceof EloquentBuilder) {
             $model  = $builder->getModel();
-            $table  = $model->getTable();                                // e.g. discussions（未带前缀）
-            $prefix = $model->getConnection()->getTablePrefix();         // e.g. flarum_
-            $pk     = $model->getKeyName();                              // e.g. id
-            $from   = ($prefix ?: '') . $table;                          // e.g. flarum_discussions
-            $qualifiedPk = $from . '.' . $pk;                            // e.g. flarum_discussions.id
+            $table  = $model->getTable();                        // 可能是 discussions 或 flarum_discussions
+            $prefix = $model->getConnection()->getTablePrefix(); // e.g. flarum_
+
+            // 避免重复前缀：只在未带前缀时再补
+            $from = $table;
+            if ($prefix && strpos($from, $prefix) !== 0) {
+                $from = $prefix . $from;
+            }
+
+            $pk     = $model->getKeyName();          // e.g. id
+            $qualifiedPk = $from . '.' . $pk;        // e.g. flarum_discussions.id
 
             $builder->whereIn($qualifiedPk, $order);
             $placeholders = implode(',', array_fill(0, count($order), '?'));
@@ -81,8 +87,12 @@ class TitleFirstDiscussionGambit implements GambitInterface
             $model  = new Discussion();
             $table  = $model->getTable();
             $prefix = $model->getConnection()->getTablePrefix();
+            $from   = $table;
+            if ($prefix && strpos($from, $prefix) !== 0) {
+                $from = $prefix . $from;
+            }
             $pk     = $model->getKeyName();
-            $qualifiedPk = ($prefix ?: '') . $table . '.' . $pk;
+            $qualifiedPk = $from . '.' . $pk;
 
             try {
                 $search->getQuery()->whereIn($qualifiedPk, $order);
@@ -92,3 +102,4 @@ class TitleFirstDiscussionGambit implements GambitInterface
         }
     }
 }
+
