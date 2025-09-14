@@ -2,19 +2,24 @@
 
 use Flarum\Extend;
 use Flarum\Discussion\Search\DiscussionSearcher;
+use Flarum\Api\Controller\ListDiscussionsController;
 use LadyByron\ExactSearch\ExactScoutServiceProvider;
 use LadyByron\ExactSearch\TitleFirstDiscussionGambit;
 use LadyByron\ExactSearch\ApplyTitleFirstOnRelevance;
 
 return [
-    // 注册 Scout（Meilisearch）覆盖
+    // 若你在用 Meilisearch 精确引擎，保留（可选）
     (new Extend\ServiceProvider())->register(ExactScoutServiceProvider::class),
 
-    // 只替换“全文解析器”，限定命中集合，不负责排序
+    // 用自定义 Gambit 限定“命中集合”
     (new Extend\SimpleFlarumSearch(DiscussionSearcher::class))
         ->setFullTextGambit(TitleFirstDiscussionGambit::class),
 
-    // 只在 sort=relevance（或 sort 为空）时，追加“标题优先”的 SQL 排序
+    // 在搜索阶段尝试 SQL 排序（可能被其他扩展覆盖，不强依赖）
     (new Extend\Event)
         ->listen(\Flarum\Discussion\Event\Searching::class, ApplyTitleFirstOnRelevance::class),
+
+    // —— 兜底关键：序列化前对结果做稳定重排（100% 生效）——
+    (new Extend\ApiController(ListDiscussionsController::class))
+        ->prepareDataForSerialization(ApplyTitleFirstOnRelevance::class),
 ];
