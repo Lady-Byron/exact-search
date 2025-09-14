@@ -10,10 +10,13 @@ use Illuminate\Database\Eloquent\Builder as EloquentBuilder;
 use Illuminate\Database\Query\Builder as QueryBuilder;
 use Illuminate\Pagination\AbstractPaginator;
 use Illuminate\Support\Collection;
+use Psr\Http\Message\ServerRequestInterface;
 
 class ApplyTitleFirstOnRelevance
 {
-    /** 事件阶段：尝试用 SQL FIELD() 排序 */
+    /**
+     * 事件阶段：尝试 SQL 排序（可能被后续扩展覆盖，真正兜底在 __invoke 里）
+     */
     public function handle(Searching $event): void
     {
         $criteria = $event->criteria ?? null;
@@ -30,8 +33,12 @@ class ApplyTitleFirstOnRelevance
         }
     }
 
-    /** 控制器阶段：对已取回的数据进行内存重排（兜底，保证生效） */
-    public function prepare($controller, &$data, $request): void
+    /**
+     * 兜底阶段：控制器序列化前对数据进行稳定重排（保证 100% 生效）
+     * 签名为 ApiController::prepareDataForSerialization 的回调：
+     * function ($controller, array|Collection|Paginator &$data, ServerRequestInterface $request, Document $document)
+     */
+    public function __invoke($controller, &$data, ServerRequestInterface $request, $document): void
     {
         $params = $request->getQueryParams();
         $q    = trim((string)($params['filter']['q'] ?? ''));
@@ -41,21 +48,27 @@ class ApplyTitleFirstOnRelevance
             return;
         }
 
-        [$orderedIds, $positions] = $this->buildOrder($q);
-        if (!$orderedIds) {
+        [, $positions] = $this->buildOrder($q);
+        if (!$positions) {
             return;
         }
 
-        // 支持 Collection 或 LengthAwarePaginator/Paginator
         if ($data instanceof AbstractPaginator) {
-            $col = $this->reorderCollection($data->getCollection(), $positions);
-            $data->setCollection($col);
-        } elseif ($data instanceof Collection) {
-            $data = $this->reorderCollection($data, $positions);
+            $data->setCollection($this->reorderCollection($data->getCollection(), $positions));
+            return;
         }
+
+        if ($data instanceof Collection) {
+            $data = $this->reorderCollection($data, $positions);
+            return;
+        }
+
+        // 若是数组/其它类型，保持安全不处理
     }
 
-    /** 判断是否“相关推荐(relevance)”（含空 sort） */
+    /**
+     * 判断是否“相关推荐(relevance)”（含空 sort）
+     */
     private function isRelevance($sort): bool
     {
         if ($sort === null || $sort === '') return true;
@@ -67,7 +80,9 @@ class ApplyTitleFirstOnRelevance
         return false;
     }
 
-    /** 生成“标题优先，其次正文”的 ID 顺序与位置表 */
+    /**
+     * 生成“标题优先，其次正文”的 ID 顺序与位置表
+     */
     private function buildOrder(string $q): array
     {
         // 1) 标题命中
@@ -79,9 +94,11 @@ class ApplyTitleFirstOnRelevance
         $bodyDiscussionIds = [];
         if ($postIds) {
             $map = Post::query()
-                ->whereIn('id', $postIds)
-                ->pluck('discussion_id', 'id');
+                ->whereIn('id', array_map('intval', $postIds))
+                ->pluck('discussion_id', 'id'); // key: post_id, value: discussion_id
+
             foreach ($postIds as $pid) {
+                $pid = (int) $pid;
                 if (isset($map[$pid])) {
                     $bodyDiscussionIds[] = (int) $map[$pid];
                 }
@@ -93,19 +110,24 @@ class ApplyTitleFirstOnRelevance
             return [[], []];
         }
 
+        // 标题优先 + 合并正文命中
         $ordered = $titleIds;
         foreach ($bodyDiscussionIds as $did) {
             if (!in_array($did, $ordered, true)) {
                 $ordered[] = $did;
             }
         }
-        $ordered = array_slice($ordered, 0, 1000);
+
+        // 限制长度，避免巨大的 FIELD 列表
+        $ordered   = array_slice($ordered, 0, 1000);
         $positions = array_flip($ordered);
 
         return [$ordered, $positions];
     }
 
-    /** SQL层排序（多数情况下够用） */
+    /**
+     * SQL 层排序（事件阶段尝试，可能被覆盖）
+     */
     private function applySqlOrder($builder, string $q): void
     {
         [$ordered, ] = $this->buildOrder($q);
@@ -114,24 +136,23 @@ class ApplyTitleFirstOnRelevance
         $model = new Discussion();
         $pk    = $model->getKeyName();
 
-        if ($builder instanceof EloquentBuilder) {
-            $from = $builder->getQuery()->from ?: $model->getTable();
-        } else { // QueryBuilder
-            $from = $builder->from ?: $model->getTable();
-        }
-        $qualifiedId = $from . '.' . $pk;
-        $list = implode(',', $ordered);
+        $from = $builder instanceof EloquentBuilder
+            ? ($builder->getQuery()->from ?: $model->getTable())
+            : ($builder->from ?: $model->getTable());
 
-        // 先把不在列表里的行放到最后，再按列表顺序排前面
-        $builder->reorder();
+        $qualifiedId = $from . '.' . $pk;
+        $list = implode(',', $ordered); // 主键为 int，无需引号
+
+        $builder->reorder(); // 清除已有 order by
         $builder->orderByRaw('(FIELD(' . $qualifiedId . ', ' . $list . ') = 0)');
         $builder->orderByRaw('FIELD(' . $qualifiedId . ', ' . $list . ')');
     }
 
-    /** 内存重排（保持未命中项的原始相对顺序，稳定排序） */
+    /**
+     * 内存稳定重排（保持未命中项原相对顺序）
+     */
     private function reorderCollection(Collection $c, array $positions): Collection
     {
-        // 记录原始位置，用作稳定排序的次级键
         $origIndex = [];
         foreach ($c->values() as $i => $m) {
             $origIndex[(int) $m->id] = $i;
@@ -142,12 +163,7 @@ class ApplyTitleFirstOnRelevance
                 $idb = (int) $b->id;
                 $pa = $positions[$ida] ?? PHP_INT_MAX;
                 $pb = $positions[$idb] ?? PHP_INT_MAX;
-
-                if ($pa === $pb) {
-                    // 稳定：保持未命中/同位置项的原始先后
-                    return ($origIndex[$ida] <=> $origIndex[$idb]);
-                }
-                return $pa <=> $pb;
+                return $pa === $pb ? ($origIndex[$ida] <=> $origIndex[$idb]) : ($pa <=> $pb);
             })
             ->values();
     }
