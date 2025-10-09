@@ -45,7 +45,7 @@ class ExactMeilisearchEngine extends Engine
             return $payload;
         })->values()->all();
 
-        $this->meilisearch->index($index)->addDocuments($documents, $keyName);
+        $this->meilisearch->index($index)->addDocuments($documents);
     }
 
     public function delete($models)
