@@ -13,18 +13,6 @@ use Illuminate\Database\Eloquent\Builder as EloquentBuilder;
 use Illuminate\Database\Query\Builder as QueryBuilder;
 use Psr\Http\Message\ServerRequestInterface;
 
-/**
- * 方案 A：分页感知 + 预排序 的 Fulltext Gambit
- *
- * 目标：当“标题命中 + 正文命中”混合时，保证**当前页**优先显示尽可能多的标题命中；
- * 若标题命中数 >= 本页容量，则本页全部都是标题命中。
- *
- * 做法：
- * 1) 读取 page[limit]/page[offset]；
- * 2) 计算：$titleIds（标题命中讨论ID，来自 Scout）、$bodyIds（正文命中映射为讨论ID，去掉已在标题中的）；
- * 3) 计算“本页应出现的 ID”$pageIds：先从 $titleIds 按 offset 切片补满，再用 $bodyIds 补齐；
- * 4) WHERE 限定到“全集合 = 标题∪正文”；ORDER BY 依次让 $pageIds、剩余标题、剩余正文 排在前面（用 FIELD()）。
- */
 class TitleFirstDiscussionGambit implements GambitInterface
 {
     public function apply(SearchState $search, $bit)
@@ -47,7 +35,7 @@ class TitleFirstDiscussionGambit implements GambitInterface
             if (isset($params['page']['limit']))  $limit  = max(1, (int) $params['page']['limit']);
             if (isset($params['page']['offset'])) $offset = max(0, (int) $params['page']['offset']);
         } catch (\Throwable $e) {
-            // 容器里拿不到请求也没关系，使用默认值
+            // 拿不到请求上下文就用默认值
         }
 
         // ---- 收集命中 ID：标题命中、正文命中（映射为讨论）----
@@ -61,12 +49,20 @@ class TitleFirstDiscussionGambit implements GambitInterface
 
         $bodyIds = [];
         if ($postIds) {
-            // 用一个轻量查询把帖子 ID 映射为讨论 ID；避免 N+1
+            // ✅ 关键修复：不要手动拼接前缀！直接用逻辑表名 'posts'
             /** @var \Illuminate\Database\ConnectionInterface $conn */
             $conn = $builder->getConnection();
-            $prefix = $conn->getTablePrefix();
-            $posts = $prefix . 'posts';
-            $rows = $conn->table($posts)->select('discussion_id')->whereIn('id', $postIds)->pluck('discussion_id')->all();
+
+            // 也可以用下行更稳拿到逻辑表名（通常就是 'posts'）：
+            // $postsTable = (new Post())->getTable();
+            $postsTable = 'posts';
+
+            $rows = $conn->table($postsTable)
+                ->select('discussion_id')
+                ->whereIn('id', $postIds)
+                ->pluck('discussion_id')
+                ->all();
+
             $bodyIds = array_values(array_unique(array_map('intval', $rows)));
         }
 
@@ -109,9 +105,6 @@ class TitleFirstDiscussionGambit implements GambitInterface
         $this->orderByFieldFirst($builder, $qualifiedForOrder, $pageIds);
         $this->orderByFieldFirst($builder, $qualifiedForOrder, $remainTitle);
         $this->orderByFieldFirst($builder, $qualifiedForOrder, $remainBody);
-
-        // 注意：后续仍可能有其它扩展再追加排序，但我们的“桶排序”已把“本页应出现的 20 条”顶到最前，
-        // 分页(LIMIT/OFFSET)发生之前顺序已经锁定。
     }
 
     /**
@@ -134,23 +127,18 @@ class TitleFirstDiscussionGambit implements GambitInterface
      */
     protected function resolveQualifiedIdColumns($builder): array
     {
-        // Eloquent Builder：直接用模型提供的限定键名
         if ($builder instanceof EloquentBuilder) {
             $model = $builder->getModel();
             $qualified = method_exists($model, 'getQualifiedKeyName')
                 ? $model->getQualifiedKeyName()
                 : ($model->getTable() . '.' . $model->getKeyName());
-
-            // 对于 ORDER / WHERE，使用相同的限定名最稳妥（前缀由语法器添加）
             return [$qualified, $qualified];
         }
 
-        // Query Builder：从 from / 连接中推断
         if ($builder instanceof QueryBuilder) {
             $conn   = $builder->getConnection();
             $prefix = $conn->getTablePrefix();
             $from   = $builder->from ?: 'discussions';
-            // 去掉已有前缀，交给语法器再次添加（避免双前缀）
             $tableNoPrefix = $from;
             if ($prefix && strpos($tableNoPrefix, $prefix) === 0) {
                 $tableNoPrefix = substr($tableNoPrefix, strlen($prefix));
@@ -159,7 +147,6 @@ class TitleFirstDiscussionGambit implements GambitInterface
             return [$qualified, $qualified];
         }
 
-        // 兜底
         return ['id', 'id'];
     }
 }
