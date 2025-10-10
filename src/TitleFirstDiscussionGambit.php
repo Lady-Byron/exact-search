@@ -35,7 +35,7 @@ class TitleFirstDiscussionGambit implements GambitInterface
             if (isset($params['page']['limit']))  $limit  = max(1, (int) $params['page']['limit']);
             if (isset($params['page']['offset'])) $offset = max(0, (int) $params['page']['offset']);
         } catch (\Throwable $e) {
-            // 拿不到请求上下文就用默认值
+            // 无请求上下文则用默认值
         }
 
         // ---- 收集命中 ID：标题命中、正文命中（映射为讨论）----
@@ -49,13 +49,11 @@ class TitleFirstDiscussionGambit implements GambitInterface
 
         $bodyIds = [];
         if ($postIds) {
-            // ✅ 关键修复：不要手动拼接前缀！直接用逻辑表名 'posts'
             /** @var \Illuminate\Database\ConnectionInterface $conn */
             $conn = $builder->getConnection();
 
-            // 也可以用下行更稳拿到逻辑表名（通常就是 'posts'）：
-            // $postsTable = (new Post())->getTable();
-            $postsTable = 'posts';
+            // 用逻辑表名，交给语法器自动加前缀（避免 flarum_flarum_posts）
+            $postsTable = (new Post())->getTable(); // 通常为 'posts'
 
             $rows = $conn->table($postsTable)
                 ->select('discussion_id')
@@ -71,7 +69,6 @@ class TitleFirstDiscussionGambit implements GambitInterface
         $allIds  = array_values(array_unique(array_merge($titleIds, $bodyIds)));
 
         if (!$allIds) {
-            // 没任何命中则不限定
             return;
         }
 
@@ -91,7 +88,7 @@ class TitleFirstDiscussionGambit implements GambitInterface
         }
 
         // ---- WHERE：限定到“全集合（标题∪正文）”----
-        [$qualifiedForWhere, $qualifiedForOrder] = $this->resolveQualifiedIdColumns($builder);
+        [$qualifiedForWhere, $qualifiedForOrderRaw] = $this->resolveIdColumns($builder);
         $builder->whereIn($qualifiedForWhere, $allIds);
 
         // ---- ORDER：把“本页应出现的 ID”排在最前；再剩余标题；再剩余正文 ----
@@ -102,51 +99,58 @@ class TitleFirstDiscussionGambit implements GambitInterface
         $remainTitle = array_values(array_diff($titleIds, $pageIds));
         $remainBody  = array_values(array_diff($bodyIds,  $pageIds));
 
-        $this->orderByFieldFirst($builder, $qualifiedForOrder, $pageIds);
-        $this->orderByFieldFirst($builder, $qualifiedForOrder, $remainTitle);
-        $this->orderByFieldFirst($builder, $qualifiedForOrder, $remainBody);
+        $this->orderByFieldFirst($builder, $qualifiedForOrderRaw, $pageIds);
+        $this->orderByFieldFirst($builder, $qualifiedForOrderRaw, $remainTitle);
+        $this->orderByFieldFirst($builder, $qualifiedForOrderRaw, $remainBody);
     }
 
     /**
-     * 生成 “这些ID优先且按此顺序” 的 FIELD 排序两段：
-     *   1) (FIELD(id, ...) = 0)  把不在列表内的放到后面
-     *   2) FIELD(id, ...)        列表内按给定顺序
+     * 为 ORDER BY RAW 专门返回“带前缀的 from 表名 + 主键”，例如 flarum_discussions.id
+     * 同时也返回 WHERE 使用的“无前缀限定名”（如 discussions.id），交给语法器处理前缀。
      */
-    protected function orderByFieldFirst($builder, string $qualifiedId, array $ids): void
+    protected function resolveIdColumns($builder): array
+    {
+        if ($builder instanceof EloquentBuilder) {
+            $model = $builder->getModel();
+            $qb    = $builder->getQuery();
+
+            // WHERE 用限定名（无前缀），Laravel 会自动补前缀
+            $whereQualified = method_exists($model, 'getQualifiedKeyName')
+                ? $model->getQualifiedKeyName()                  // e.g. discussions.id
+                : ($model->getTable() . '.' . $model->getKeyName());
+
+            // ORDER RAW 需要**带前缀**的 from 表名
+            $fromTable = $qb->from ?: $model->getTable();        // e.g. flarum_discussions
+            $orderQualified = $fromTable . '.' . $model->getKeyName(); // flarum_discussions.id
+
+            return [$whereQualified, $orderQualified];
+        }
+
+        if ($builder instanceof QueryBuilder) {
+            $qb       = $builder;
+            $from     = $qb->from ?: 'discussions'; // 这通常已带前缀（如 flarum_discussions）
+            $orderQualified = $from . '.id';        // 用于 RAW（带前缀）
+            // WHERE 用无前缀限定名，交给语法器处理
+            $whereQualified = 'discussions.id';
+
+            return [$whereQualified, $orderQualified];
+        }
+
+        // 兜底
+        return ['discussions.id', 'discussions.id'];
+    }
+
+    /**
+     * 生成 “这些ID优先且按此顺序” 的 FIELD 两段排序：
+     *   1) (FIELD(tbl.id, ...) = 0)  把不在列表内的放到后面
+     *   2) FIELD(tbl.id, ...)        列表内按给定顺序
+     */
+    protected function orderByFieldFirst($builder, string $qualifiedIdForRaw, array $ids): void
     {
         if (empty($ids)) return;
 
         $list = implode(',', array_map('intval', $ids));
-        $builder->orderByRaw('(FIELD(' . $qualifiedId . ', ' . $list . ') = 0)');
-        $builder->orderByRaw('FIELD(' . $qualifiedId . ', ' . $list . ')');
-    }
-
-    /**
-     * 解析 WHERE/ORDER 应使用的 ID 列名（考虑 Eloquent/Query builder 以及表前缀）。
-     * 返回数组：[$qualifiedForWhere, $qualifiedForOrder]
-     */
-    protected function resolveQualifiedIdColumns($builder): array
-    {
-        if ($builder instanceof EloquentBuilder) {
-            $model = $builder->getModel();
-            $qualified = method_exists($model, 'getQualifiedKeyName')
-                ? $model->getQualifiedKeyName()
-                : ($model->getTable() . '.' . $model->getKeyName());
-            return [$qualified, $qualified];
-        }
-
-        if ($builder instanceof QueryBuilder) {
-            $conn   = $builder->getConnection();
-            $prefix = $conn->getTablePrefix();
-            $from   = $builder->from ?: 'discussions';
-            $tableNoPrefix = $from;
-            if ($prefix && strpos($tableNoPrefix, $prefix) === 0) {
-                $tableNoPrefix = substr($tableNoPrefix, strlen($prefix));
-            }
-            $qualified = $tableNoPrefix . '.id';
-            return [$qualified, $qualified];
-        }
-
-        return ['id', 'id'];
+        $builder->orderByRaw('(FIELD(' . $qualifiedIdForRaw . ', ' . $list . ') = 0)');
+        $builder->orderByRaw('FIELD(' . $qualifiedIdForRaw . ', ' . $list . ')');
     }
 }
