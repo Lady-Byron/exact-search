@@ -7,7 +7,7 @@
     { "name": "Lady Byron", "email": "admin@romanceof3.love" }
   ],
   "require": {
-    "flarum/core": "^1.6 || ^1.7 || ^1.8 || ^1.9",
+    "flarum/core": "^1.6 || ^1.7 || ^1.8 || ^1.9"
   },
   "autoload": {
     "psr-4": {
