@@ -14,7 +14,7 @@
   },
   "extra": {
     "flarum-extension": {
-      "title": "Exact Search (Meilisearch + Scout)",
+      "title": "Exact Search",
       "category": "search",
       "icon": {
         "name": "fas fa-bullseye",
