@@ -102,14 +102,22 @@ class ExactMeilisearchEngine extends Engine
         $q = trim($q);
         if ($q === '') return $q;
 
-        // 已是短语或含空白 -> 不改
-        if ((substr($q, 0, 1) === '"' && substr($q, -1) === '"') || preg_match('/\s/u', $q)) {
+        // 1. 尊重用户的高级操作（已加引号不乱动）
+        if ((substr($q, 0, 1) === '"' && substr($q, -1) === '"')) {
             return $q;
         }
 
-        // 纯中文（>=2 汉字）-> 转为短语
-        if (preg_match('/^[\x{4E00}-\x{9FFF}]{2,}$/u', $q)) {
-            return '"' . $q . '"';
+        // 2. 【找回丢失数据的关键】强力清洗
+        // 把 "【曹刘】"、"曹、刘"、"曹刘。" 全部变成纯净的 "曹刘"
+        // 这一步能解决 Meilisearch 因符号而漏掉那 6 个帖子的 BUG
+        $cleanQ = preg_replace('/[^\p{L}\p{N}]+/u', '', $q);
+
+        if ($cleanQ === '') return $q;
+
+        // 3. 【踢出垃圾数据的关键】自动加引号
+        // 只要是中文词，就强制开启短语匹配
+        if (preg_match('/^[\x{4E00}-\x{9FFF}]{2,}$/u', $cleanQ)) {
+            return '"' . $cleanQ . '"'; 
         }
 
         return $q;
